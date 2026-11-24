@@ -3454,8 +3454,13 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(nonzero));
                     Ok(())
                 }
-                "s_bcnt1_i32_b64" => {
-                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                "s_bcnt0_i32_b64" | "s_bcnt1_i32_b64" => {
+                    let (mut a, mut b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    if name.starts_with("s_bcnt0_") {
+                        let ones = self.s.m.i32(u32::MAX);
+                        a = self.s.m.bin(c, Bin::Xor, a, ones);
+                        b = self.s.m.bin(c, Bin::Xor, b, ones);
+                    }
                     let i32t = self.s.t.i32;
                     let na = self
                         .s
@@ -3470,9 +3475,14 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
-                "s_ff1_i32_b64" => {
-                    // The lowest set bit; -1 for none (as DXIL's first bit low).
-                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                "s_ff0_i32_b64" | "s_ff1_i32_b64" => {
+                    // The lowest set (or clear) bit; -1 for none (as DXIL's first bit low).
+                    let (mut a, mut b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    if name.starts_with("s_ff0_") {
+                        let ones = self.s.m.i32(u32::MAX);
+                        a = self.s.m.bin(c, Bin::Xor, a, ones);
+                        b = self.s.m.bin(c, Bin::Xor, b, ones);
+                    }
                     let i32t = self.s.t.i32;
                     let fa = self
                         .s
@@ -3658,10 +3668,14 @@ impl<'a> Lower<'a> {
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
                 (r, None)
             }
-            "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
-                // First set bit (-1 for zero, as DXIL's), or the bit count.
-                let a = src32(self, 0)?;
-                let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
+            "s_ff0_i32_b32" | "s_ff1_i32_b32" | "s_bcnt0_i32_b32" | "s_bcnt1_i32_b32" => {
+                // First set/clear bit (-1 for none, as DXIL's), or the bit count.
+                let mut a = src32(self, 0)?;
+                if name.contains("0_") {
+                    let ones = self.s.m.i32(u32::MAX);
+                    a = self.s.m.bin(c, Bin::Xor, a, ones);
+                }
+                let op = if name.starts_with("s_ff") { 32 } else { 31 };
                 let r = self
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);

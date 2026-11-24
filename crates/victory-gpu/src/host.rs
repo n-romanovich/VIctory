@@ -504,6 +504,27 @@ impl Host {
         })
     }
 
+    /// Whether the host supports `OMSetDepthBounds` (`D3D12_FEATURE_D3D12_OPTIONS2`).
+    pub(crate) fn depth_bounds(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+            // SAFETY: writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS2,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let supported = ok && options.DepthBoundsTestSupported.as_bool();
+            tracing::info!(supported, "host depth bounds test support");
+            supported
+        })
+    }
+
     /// Whether the host runs 64-bit atomics on typed resources in the
     /// descriptor heap (translated 64-bit image atomics); logged once.
     pub(crate) fn heap_atomics64(&self) -> bool {

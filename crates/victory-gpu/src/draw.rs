@@ -1814,6 +1814,24 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     unsafe { list.list.OMSetStencilRef(reference) };
 }
 
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    if !host.depth_bounds() {
+        once!("depth bounds test is not supported by the host");
+        return;
+    }
+    if !(0.0..=1.0).contains(&min) || !(0.0..=1.0).contains(&max) || min > max {
+        once!(min, max, "invalid depth bounds ignored");
+        return;
+    }
+    if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+        // SAFETY: an open list and validated [0.0, 1.0] bounds with min <= max.
+        unsafe { list1.OMSetDepthBounds(min, max) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2442,5 +2460,332 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    #[test]
+    fn depth_bounds_filters_pixels_by_existing_depth() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !host.depth_bounds() {
+            return;
+        }
+        let hlsl = r#"
+#define RS ""
+[RootSignature(RS)]
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 p = float2((id << 1) & 2, id & 2);
+    return float4(p * 2.0 - 1.0, 0.5, 1.0);
+}
+[RootSignature(RS)]
+float4 ps() : SV_Target {
+    return float4(1.0, 1.0, 1.0, 1.0);
+}
+"#;
+        let compile = |entry: &windows::core::PCSTR, target: &windows::core::PCSTR| -> ID3DBlob {
+            let (mut blob, mut err) = (None, None);
+            // SAFETY: valid static HLSL source and entry/target strings.
+            unsafe {
+                D3DCompile(
+                    hlsl.as_ptr().cast(),
+                    hlsl.len(),
+                    None,
+                    None,
+                    None,
+                    *entry,
+                    *target,
+                    0,
+                    0,
+                    &mut blob,
+                    Some(&mut err),
+                )
+                .unwrap();
+            }
+            blob.unwrap()
+        };
+        let vs = compile(&s!("vs"), &s!("vs_5_1"));
+        let ps = compile(&s!("ps"), &s!("ps_5_1"));
+
+        let tex = |format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES, clear: &D3D12_CLEAR_VALUE| -> ID3D12Resource {
+            let mut r = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: flags,
+                ..Default::default()
+            };
+            // SAFETY: valid device, default heap, and texture description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        Some(clear),
+                        &mut r,
+                    )
+                    .unwrap();
+            }
+            r.unwrap()
+        };
+
+        let rtv_clear = D3D12_CLEAR_VALUE {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] },
+        };
+        let dsv_clear = D3D12_CLEAR_VALUE {
+            Format: DXGI_FORMAT_D32_FLOAT,
+            Anonymous: D3D12_CLEAR_VALUE_0 {
+                DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 0.5, Stencil: 0 },
+            },
+        };
+        let rt = tex(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            &rtv_clear,
+        );
+        let ds = tex(
+            DXGI_FORMAT_D32_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            &dsv_clear,
+        );
+
+        let heap = |kind: D3D12_DESCRIPTOR_HEAP_TYPE| -> ID3D12DescriptorHeap {
+            // SAFETY: valid 1-slot CPU descriptor heap.
+            unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+            }
+            .unwrap()
+        };
+        let rtv_heap = heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        let dsv_heap = heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        // SAFETY: live heaps and resources.
+        let (rtv, dsv) = unsafe {
+            let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart();
+            host.device.CreateRenderTargetView(&rt, None, rtv);
+            host.device.CreateDepthStencilView(&ds, None, dsv);
+            (rtv, dsv)
+        };
+
+        // SAFETY: valid compiled shaders and stream PSO with DepthBoundsTestEnable = true.
+        let (root, pso) = unsafe {
+            use windows::core::Interface;
+            let vs_bytes = std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize());
+            let ps_bytes = std::slice::from_raw_parts(ps.GetBufferPointer().cast::<u8>(), ps.GetBufferSize());
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, vs_bytes).unwrap();
+            #[repr(C, align(8))]
+            struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
+            #[repr(C)]
+            struct Stream {
+                root: Sub<*mut std::ffi::c_void>,
+                vs: Sub<D3D12_SHADER_BYTECODE>,
+                ps: Sub<D3D12_SHADER_BYTECODE>,
+                blend: Sub<D3D12_BLEND_DESC>,
+                mask: Sub<u32>,
+                raster: Sub<D3D12_RASTERIZER_DESC>,
+                depth: Sub<D3D12_DEPTH_STENCIL_DESC1>,
+                topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+                targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+                dsv: Sub<DXGI_FORMAT>,
+                samples: Sub<DXGI_SAMPLE_DESC>,
+            }
+            let mut rt_formats = D3D12_RT_FORMAT_ARRAY {
+                NumRenderTargets: 1,
+                ..Default::default()
+            };
+            rt_formats.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            let mut stream = Stream {
+                root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+                vs: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS,
+                    D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: vs_bytes.as_ptr().cast(),
+                        BytecodeLength: vs_bytes.len(),
+                    },
+                ),
+                ps: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+                    D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: ps_bytes.as_ptr().cast(),
+                        BytecodeLength: ps_bytes.len(),
+                    },
+                ),
+                blend: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
+                    D3D12_BLEND_DESC {
+                        RenderTarget: [
+                            D3D12_RENDER_TARGET_BLEND_DESC {
+                                RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+                                ..Default::default()
+                            },
+                            Default::default(),
+                            Default::default(),
+                            Default::default(),
+                            Default::default(),
+                            Default::default(),
+                            Default::default(),
+                            Default::default(),
+                        ],
+                        ..Default::default()
+                    },
+                ),
+                mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, u32::MAX),
+                raster: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
+                    D3D12_RASTERIZER_DESC {
+                        FillMode: D3D12_FILL_MODE_SOLID,
+                        CullMode: D3D12_CULL_MODE_NONE,
+                        ..Default::default()
+                    },
+                ),
+                depth: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1,
+                    D3D12_DEPTH_STENCIL_DESC1 {
+                        DepthEnable: false.into(),
+                        DepthBoundsTestEnable: true.into(),
+                        ..Default::default()
+                    },
+                ),
+                topology: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                ),
+                targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, rt_formats),
+                dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT_D32_FLOAT),
+                samples: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
+                    DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ),
+            };
+            let sdesc = D3D12_PIPELINE_STATE_STREAM_DESC {
+                SizeInBytes: size_of::<Stream>(),
+                pPipelineStateSubobjectStream: (&raw mut stream).cast(),
+            };
+            let d2: ID3D12Device2 = host.device.cast().unwrap();
+            let pso: ID3D12PipelineState = d2.CreatePipelineState(&sdesc).unwrap();
+            (root, pso)
+        };
+
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: 256-byte readback buffer (aligned row pitch for 4x4 RGBA8).
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_READBACK,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 1024,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+
+        let run_pass = |min: f32, max: f32| -> [u8; 4] {
+            let list = host.new_list().unwrap();
+            let l = &list.list;
+            let vp = D3D12_VIEWPORT {
+                Width: 4.0,
+                Height: 4.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            };
+            let sc = RECT { left: 0, top: 0, right: 4, bottom: 4 };
+            // SAFETY: open list, live RTV/DSV/pipeline/readback.
+            unsafe {
+                l.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 0.0], None);
+                l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
+                l.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+                l.SetGraphicsRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.RSSetViewports(&[vp]);
+                l.RSSetScissorRects(&[sc]);
+                l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            }
+            super::depth_bounds(&list, min, max);
+            // Invalid ranges must be ignored cleanly without removing the device.
+            super::depth_bounds(&list, 0.8, 0.2);
+            super::depth_bounds(&list, f32::NAN, 0.5);
+            // SAFETY: open list, copy RT pixel 0 to readback.
+            unsafe {
+                l.DrawInstanced(3, 1, 0, 0);
+                l.ResourceBarrier(&[crate::host::transition(
+                    &rt,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: 4,
+                                Height: 4,
+                                Depth: 1,
+                                RowPitch: 256,
+                            },
+                        },
+                    },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&rt),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                l.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                l.ResourceBarrier(&[crate::host::transition(
+                    &rt,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                )]);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: `host.execute` completed; readback has 1024 bytes.
+            unsafe {
+                readback.Map(0, None, Some(&mut ptr)).unwrap();
+                let pixel = *(ptr as *const [u8; 4]);
+                readback.Unmap(0, None);
+                pixel
+            }
+        };
+
+        // Stored depth is 0.5: [0.7, 0.9] rejects, [0.4, 0.6] passes.
+        assert_eq!(run_pass(0.7, 0.9), [0, 0, 0, 0]);
+        assert_eq!(run_pass(0.4, 0.6), [255, 255, 255, 255]);
     }
 }

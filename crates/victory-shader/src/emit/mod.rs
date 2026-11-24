@@ -1600,4 +1600,142 @@ mod tests {
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
+
+    #[test]
+    fn scalar_bitcmp_and_sext_execute_on_gpu() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xBF0C_8000, // s_bitcmp0_b32 s0, 0
+            0x850C_8081, // s_cselect_b32 s12, 1, 0
+            0xBF0D_A100, // s_bitcmp1_b32 s0, 33
+            0x850D_8081, // s_cselect_b32 s13, 1, 0
+            0xBF0E_A200, // s_bitcmp0_b64 s[0:1], 34
+            0x850E_8081, // s_cselect_b32 s14, 1, 0
+            0xBF0F_BF00, // s_bitcmp1_b64 s[0:1], 63
+            0x850F_8081, // s_cselect_b32 s15, 1, 0
+            0xBF0F_BFC1, // s_bitcmp1_b64 -1, 63
+            0x8510_8081, // s_cselect_b32 s16, 1, 0
+            0xBE91_1902, // s_sext_i32_i8 s17, s2
+            0xBE92_1A03, // s_sext_i32_i16 s18, s3
+            0xBF0D_9F00, // s_bitcmp1_b32 s0, 31
+            0xBE94_1903, // s_sext_i32_i8 s20, s3 (must preserve SCC)
+            0x8513_8014, // s_cselect_b32 s19, s20, 0
+            0x7E00_020C, // v_mov_b32 v0, s12
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0x7E04_020E, // v_mov_b32 v2, s14
+            0x7E06_020F, // v_mov_b32 v3, s15
+            0x7E08_0280, // v_mov_b32 v4, 0
+            0xE078_1000,
+            0x8002_0004, // buffer_store_dwordx4 v[0:3], v4, s[8:11], 0 offen
+            0x7E00_0210, // v_mov_b32 v0, s16
+            0x7E02_0211, // v_mov_b32 v1, s17
+            0x7E04_0212, // v_mov_b32 v2, s18
+            0x7E06_0213, // v_mov_b32 v3, s19
+            0x7E08_0290, // v_mov_b32 v4, 16
+            0xE078_1000,
+            0x8002_0004, // buffer_store_dwordx4 v[0:3], v4, s[8:11], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = crate::NativeProgram {
+            stage: crate::HwStage::Cs,
+            wave64: false,
+            vgprs: 5,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![crate::UsedResource {
+                kind: crate::ResourceType::Uav,
+                root: crate::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap();
+        }
+        #[cfg(windows)]
+        if let Ok(host) = super::host::Host::new(false) {
+            let cs = super::HostShader {
+                stage: crate::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![(
+                            0,
+                            super::host::Root::Constants(vec![
+                                0x8000_0002,
+                                0x8000_0004,
+                                0x1234_5680,
+                                0x1234_807F,
+                                0,
+                            ]),
+                        )],
+                        views: &[super::host::View::RawUav(64)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                &out[0][..8],
+                &[1, 1, 0, 1, 1, 0xFFFF_FF80, 0xFFFF_807F, 0x7F]
+            );
+        }
+    }
 }

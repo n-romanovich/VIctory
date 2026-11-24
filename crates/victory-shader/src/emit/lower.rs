@@ -3431,6 +3431,31 @@ impl<'a> Lower<'a> {
             self.set(scc, Val::Bit(r));
             return Ok(());
         }
+        if matches!(
+            name,
+            "s_bitcmp0_b32" | "s_bitcmp1_b32" | "s_bitcmp0_b64" | "s_bitcmp1_b64"
+        ) {
+            let want_one = name.starts_with("s_bitcmp1_");
+            let wide = name.ends_with("_b64");
+            let bit = src32(self, 1)?;
+            let (k31, one, zero) = (self.s.m.i32(31), self.s.m.i32(1), self.s.m.i32(0));
+            let word = if wide {
+                let (lo_w, hi_w) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                let k32 = self.s.m.i32(32);
+                let hi_bit = self.s.m.bin(c, Bin::And, bit, k32);
+                let is_hi = self.s.m.cmp(c, pred::NE, hi_bit, zero);
+                self.s.m.select(c, is_hi, hi_w, lo_w)
+            } else {
+                src32(self, 0)?
+            };
+            let shift = self.s.m.bin(c, Bin::And, bit, k31);
+            let shifted = self.s.m.bin(c, Bin::LShr, word, shift);
+            let masked = self.s.m.bin(c, Bin::And, shifted, one);
+            let p = if want_one { pred::NE } else { pred::EQ };
+            let r = self.s.m.cmp(c, p, masked, zero);
+            self.set(scc, Val::Bit(r));
+            return Ok(());
+        }
         let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
         if wide {
             let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
@@ -3603,6 +3628,12 @@ impl<'a> Lower<'a> {
                     .op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[a]);
                 (r, None)
             }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let shift = self.s.m.i32(if name == "s_sext_i32_i8" { 24 } else { 16 });
+                let t = self.s.m.bin(c, Bin::Shl, a, shift);
+                (self.s.m.bin(c, Bin::AShr, t, shift), None)
+            }
             "s_not_b32" => {
                 let a = src32(self, 0)?;
                 let ones = self.s.m.i32(u32::MAX);
@@ -3766,6 +3797,8 @@ impl<'a> Lower<'a> {
                         | "s_movk_i32"
                         | "s_cselect_b32"
                         | "s_brev_b32"
+                        | "s_sext_i32_i8"
+                        | "s_sext_i32_i16"
                         | "s_mul_i32"
                         | "s_mulk_i32"
                 ) =>

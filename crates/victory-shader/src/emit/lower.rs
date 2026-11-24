@@ -3797,8 +3797,6 @@ impl<'a> Lower<'a> {
                         | "s_movk_i32"
                         | "s_cselect_b32"
                         | "s_brev_b32"
-                        | "s_sext_i32_i8"
-                        | "s_sext_i32_i16"
                         | "s_mul_i32"
                         | "s_mulk_i32"
                 ) =>

@@ -1677,9 +1677,9 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
         let l = super::lower::lower(&super::lower::Parts {
             native: &native,
             p: &p,
@@ -1690,6 +1690,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            view_marks: false,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -1709,6 +1710,13 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                memory: l.memory,
+                memory_writes: l.memory_writes,
+                view_addresses: l.view_addresses,
+                heap: l.heap,
+                heap_writes: l.heap_writes,
+                view_marks: l.view_marks,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let out = host

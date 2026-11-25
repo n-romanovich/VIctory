@@ -1453,3 +1453,20 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+/// Constant 64-bit integer compares (`v_cmp_{f,t}_{i64,u64}`) produce a
+/// constant false/true lane mask without reading 64-bit operands.
+#[test]
+fn constant_64bit_compares_produce_constant_lane_masks() {
+    for (op, want) in [(0x0a0u32, 10u32), (0x0a7, 20), (0x0e0, 10), (0x0e7, 20)] {
+        let shader = build_valu_cs(&[
+            0xD400_0000 | (op << 16) | 6,             // v_cmp_*_64_e64 s6, v[1:2], v[3:4]
+            (vgpr(3) as u32) << 9 | vgpr(1) as u32,
+            0xD501_0000,                              // v_cndmask_b32_e64 v0, 10, 20, s6
+            6 << 18 | (128 + 20) << 9 | (128 + 10),
+        ]);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: op {op:#x}");
+        });
+    }
+}
